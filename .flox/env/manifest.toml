@@ -8,11 +8,13 @@ zlib.pkg-path = "zlib"
 
 [hook]
 on-activate = '''
+  export TRITON_OPENAI_BASE="${TRITON_OPENAI_BASE:-http://localhost:9000/v1}"
+  export TRITON_API_KEY="${TRITON_API_KEY:-EMPTY}"
   export TRITON_API_BASE="${TRITON_API_BASE:-http://localhost:8000}"
   export TRITON_MODEL="${TRITON_MODEL:-}"
   export TRITON_SYSTEM_PROMPT="${TRITON_SYSTEM_PROMPT:-You are a helpful assistant.}"
 
-  # numpy (required by tritonclient) needs libstdc++ and libz
+  # numpy and grpcio need libstdc++ and libz
   export LD_LIBRARY_PATH="$FLOX_ENV/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
   VENV="$FLOX_ENV_CACHE/venv"
@@ -25,7 +27,7 @@ on-activate = '''
   source "$VENV/bin/activate"
 
   if [ ! -f "$VENV/.installed" ]; then
-    uv pip install "tritonclient[http]" rich requests
+    uv pip install "tritonclient[all]" openai rich requests
     touch "$VENV/.installed"
   fi
 '''

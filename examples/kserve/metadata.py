@@ -2,8 +2,8 @@
 """Server health and model metadata via tritonclient.http.
 
 Usage:
-  python examples/metadata.py                # show server status + TRITON_MODEL metadata
-  python examples/metadata.py <model_name>   # show metadata for a specific model
+  python examples/kserve/metadata.py                # show server status + TRITON_MODEL metadata
+  python examples/kserve/metadata.py <model_name>   # show metadata for a specific model
 """
 
 import json

@@ -1,79 +1,26 @@
 # triton-api-client
 
-Lightweight client environment for interacting with [NVIDIA Triton Inference Server](https://github.com/triton-inference-server/server) via the [KServe v2 protocol](https://kserve.github.io/website/latest/modelserving/data_plane/v2_protocol/) and Triton's generate extension for LLM text generation. Powered by [Flox](https://flox.dev).
+Lightweight client environment for [NVIDIA Triton Inference Server](https://github.com/triton-inference-server/server) covering all three client interfaces: the **OpenAI-compatible frontend**, the **generate extension**, and the **KServe v2 tensor inference protocol** (HTTP and gRPC). Powered by [Flox](https://flox.dev).
 
-Provides an interactive chat REPL (`triton-chat`), example scripts for text generation, streaming, tensor inference, and server introspection -- everything needed to develop against a Triton server without installing dependencies globally.
+Provides an interactive chat REPL (`triton-chat`), a health/smoke/benchmark tool (`triton-test`), and example scripts for every interface -- everything needed to develop against a Triton server without installing dependencies globally.
 
 ## What's in the environment
 
 | Component | Description |
 |-----------|-------------|
-| `triton-chat` | Interactive multi-turn chat REPL with streaming and markdown rendering |
-| `examples/generate.py` | Single text generation via the generate endpoint |
-| `examples/streaming.py` | Streaming text generation via SSE |
-| `examples/infer.py` | KServe v2 tensor inference using `tritonclient.http` |
-| `examples/metadata.py` | Server health checks and model metadata/config introspection |
+| `triton-chat` | Interactive multi-turn chat REPL via OpenAI-compatible frontend |
+| `triton-test` | Health check, smoke test, and benchmark tool |
+| `examples/openai/` | Chat, streaming, and batch completions via OpenAI SDK |
+| `examples/generate/` | Text generation via Triton's generate extension |
+| `examples/kserve/` | Tensor inference (HTTP and gRPC) and server metadata |
 
-## Triton API endpoints used
+## Three Triton interfaces
 
-This client targets two distinct Triton interfaces:
-
-### Generate extension (LLM text generation)
-
-The [generate extension](https://github.com/triton-inference-server/server/blob/main/docs/protocol/extension_generate.md) is Triton's interface for text-generation models (e.g. vLLM, TensorRT-LLM backends). It is **not** part of the core KServe v2 spec -- it is a Triton-specific extension.
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v2/models/{model}/generate` | POST | Single text generation (blocking) |
-| `/v2/models/{model}/generate_stream` | POST | Streaming text generation (SSE) |
-
-**Request format** (both endpoints):
-
-```json
-{
-  "text_input": "What is the capital of France?",
-  "parameters": {
-    "max_tokens": 256
-  }
-}
-```
-
-**Response format** (generate):
-
-```json
-{
-  "model_name": "my-llm",
-  "model_version": "1",
-  "text_output": "The capital of France is Paris."
-}
-```
-
-**Response format** (generate_stream): Server-Sent Events, one per token:
-
-```
-data: {"text_output": "The"}
-data: {"text_output": " capital"}
-data: {"text_output": " of"}
-...
-```
-
-### KServe v2 inference protocol
-
-The [KServe v2 inference protocol](https://kserve.github.io/website/latest/modelserving/data_plane/v2_protocol/) is the standard tensor-in/tensor-out interface for any model type (classification, detection, embedding, etc.).
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v2/health/live` | GET | Server liveness probe |
-| `/v2/health/ready` | GET | Server readiness probe |
-| `/v2/models/{model}` | GET | Model metadata (inputs, outputs, datatypes) |
-| `/v2/models/{model}/config` | GET | Model configuration |
-| `/v2/models/{model}/infer` | POST | Tensor inference |
-
-The `infer` endpoint uses structured tensor payloads with typed inputs/outputs, accessed via the `tritonclient.http` Python library rather than raw HTTP.
-
-### Key difference from OpenAI-compatible APIs
-
-Triton does **not** use the OpenAI chat completions format. There are no `/v1/chat/completions` or `/v1/models` endpoints and no API key authentication. Multi-turn conversation state must be managed client-side by building the full prompt from history (which `triton-chat` handles automatically).
+| Interface | Port | Protocol | Use case | Client library |
+|-----------|------|----------|----------|----------------|
+| OpenAI-compatible frontend | 9000 | HTTP | LLM chat/completions (dominant pattern) | `openai` Python SDK |
+| Generate extension | 8000 | HTTP | Triton-specific LLM text generation | `requests` |
+| KServe v2 inference | 8000 HTTP / 8001 gRPC | HTTP + gRPC | Standard tensor inference for any model type | `tritonclient.http`, `tritonclient.grpc` |
 
 ## Quick start
 
@@ -81,46 +28,71 @@ Triton does **not** use the OpenAI chat completions format. There are no `/v1/ch
 cd ~/dev/triton-api-client
 flox activate
 
-# Interactive chat (requires a running Triton server with a text-generation model)
+# ── OpenAI-compatible frontend (port 9000) ──────────────────────────
+
+# Interactive chat
 TRITON_MODEL=my-llm triton-chat
 
-# Single text generation
-TRITON_MODEL=my-llm python examples/generate.py "What is the capital of France?"
+# Health check + smoke test
+TRITON_MODEL=my-llm triton-test
 
-# Streaming text generation
-TRITON_MODEL=my-llm python examples/streaming.py "Explain quantum computing"
+# Benchmark
+TRITON_MODEL=my-llm triton-test bench -n 50 --concurrent 5
 
-# KServe v2 tensor inference
-TRITON_MODEL=my-model python examples/infer.py "hello world"
+# Single completion
+TRITON_MODEL=my-llm python examples/openai/chat.py "What is the capital of France?"
+
+# Streaming completion
+TRITON_MODEL=my-llm python examples/openai/streaming.py "Explain quantum computing"
+
+# Batch completions from JSON
+echo '["Hello", "What is 2+2?"]' | TRITON_MODEL=my-llm python examples/openai/batch.py -
+
+# ── Generate extension (port 8000) ──────────────────────────────────
+
+TRITON_MODEL=my-llm python examples/generate/single.py "Hello!"
+TRITON_MODEL=my-llm python examples/generate/streaming.py "Write a haiku"
+
+# ── KServe v2 tensor inference (port 8000 HTTP / 8001 gRPC) ────────
+
+# HTTP inference
+TRITON_MODEL=my-model python examples/kserve/infer_http.py "hello world"
+
+# gRPC inference
+TRITON_MODEL=my-model python examples/kserve/infer_grpc.py "hello world"
+
+# Async gRPC (3 concurrent requests)
+TRITON_MODEL=my-model python examples/kserve/infer_async.py
 
 # Server health and model metadata
-python examples/metadata.py
-TRITON_MODEL=my-model python examples/metadata.py
+python examples/kserve/metadata.py
+TRITON_MODEL=my-model python examples/kserve/metadata.py
 ```
 
 ## Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TRITON_API_BASE` | `http://localhost:8000` | Triton server URL (scheme + host + port, no path suffix) |
-| `TRITON_MODEL` | _(none)_ | Model name as registered in Triton's model repository |
-| `TRITON_SYSTEM_PROMPT` | `You are a helpful assistant.` | System prompt prepended to conversations in `triton-chat` |
+| `TRITON_OPENAI_BASE` | `http://localhost:9000/v1` | OpenAI-compatible frontend URL |
+| `TRITON_API_KEY` | `EMPTY` | API key for OpenAI frontend auth |
+| `TRITON_API_BASE` | `http://localhost:8000` | KServe v2 + generate extension URL |
+| `TRITON_MODEL` | _(none)_ | Model name (used across all interfaces) |
+| `TRITON_SYSTEM_PROMPT` | `You are a helpful assistant.` | System prompt for `triton-chat` |
+| `TRITON_GRPC_PORT` | `8001` | gRPC port for KServe tensor inference |
 
 All variables are set with `${VAR:-default}` fallbacks in the Flox `on-activate` hook, so they can be overridden at activation time or per-command:
 
 ```bash
 # Override at activation time (persists for session)
-TRITON_API_BASE=http://gpu-server:8000 TRITON_MODEL=ensemble flox activate
+TRITON_OPENAI_BASE=http://gpu-server:9000/v1 TRITON_MODEL=llama flox activate
 
 # Override per-command
-TRITON_MODEL=llama python examples/generate.py "Hello"
+TRITON_MODEL=llama python examples/openai/chat.py "Hello"
 ```
-
-**Note**: Unlike vLLM's OpenAI-compatible API, Triton has no built-in authentication -- there is no API key variable. If your Triton deployment is behind a reverse proxy with auth, handle that separately.
 
 ## Chat CLI
 
-`triton-chat` is an interactive REPL that streams responses from Triton's `generate_stream` endpoint and renders output as markdown using [Rich](https://github.com/Textualize/rich).
+`triton-chat` is an interactive REPL that uses Triton's OpenAI-compatible frontend (port 9000) to stream chat completions and renders output as markdown using [Rich](https://github.com/Textualize/rich).
 
 ### Commands
 
@@ -132,26 +104,11 @@ TRITON_MODEL=llama python examples/generate.py "Hello"
 | `/help` | Show available commands |
 | `/quit` | Exit the chat (also: `/exit`, Ctrl+C, Ctrl+D) |
 
-### Multi-turn conversation
-
-Since Triton's generate endpoint accepts a raw text prompt (not structured chat messages), `triton-chat` builds multi-turn context client-side using a simple template:
-
-```
-<system prompt>
-
-User: <first message>
-Assistant: <first response>
-User: <second message>
-Assistant:
-```
-
-The full prompt is sent on each turn, so the model sees the complete conversation history. Use `/clear` to reset when the context gets too long.
-
 ### Example session
 
 ```
 $ TRITON_MODEL=llama triton-chat
-triton-chat connected to http://localhost:8000
+triton-chat connected to http://localhost:9000/v1
 Model: llama
 Type /help for commands, /quit to exit.
 
@@ -163,126 +120,107 @@ you> And if you multiply that by 3?
 
 4 multiplied by 3 is 12.
 
-you> /model mixtral
-Model set to mixtral
-you> /clear
-Conversation cleared.
 you> /quit
 Bye!
 ```
 
+## Test CLI
+
+`triton-test` checks server connectivity, runs smoke tests, and benchmarks throughput via the OpenAI-compatible frontend.
+
+### Usage
+
+```bash
+# Health check + smoke test (exit 0 on success, 1 on failure)
+triton-test
+
+# Benchmark with defaults (10 requests, concurrency 1)
+triton-test bench
+
+# Heavier load test
+triton-test bench -n 50 --concurrent 5 --max-tokens 256
+
+# Custom prompt
+triton-test bench --prompt "Summarize the theory of relativity"
+```
+
+### What it tests
+
+| Check | Description |
+|-------|-------------|
+| **Health** | Connects to server, lists available models |
+| **Smoke (non-streaming)** | Single completion, reports latency and token count |
+| **Smoke (streaming)** | Streaming completion, reports TTFT and chunk count |
+| **Benchmark** | Concurrent streaming requests with p50/p90/p99 latency, TTFT, ITL, tokens/sec |
+
 ## Example scripts
 
-### `examples/generate.py` -- Single text generation
+### OpenAI-compatible frontend (`examples/openai/`)
 
-Sends a one-shot prompt to `POST /v2/models/{model}/generate` and prints the response. Analogous to a non-streaming chat completion.
+| Script | Description |
+|--------|-------------|
+| `chat.py` | Single chat completion (non-streaming) |
+| `streaming.py` | Streaming chat completion, prints tokens as they arrive |
+| `batch.py` | Batch completions from a JSON array, outputs JSONL with usage stats |
 
-```bash
-python examples/generate.py "What is the capital of France?"
-python examples/generate.py                                    # defaults to "Hello!"
+### Generate extension (`examples/generate/`)
+
+| Script | Description |
+|--------|-------------|
+| `single.py` | Single text generation via `POST /v2/models/{model}/generate` |
+| `streaming.py` | Streaming text generation via SSE from `generate_stream` |
+
+### KServe v2 inference (`examples/kserve/`)
+
+| Script | Description |
+|--------|-------------|
+| `infer_http.py` | Synchronous tensor inference via `tritonclient.http` |
+| `infer_grpc.py` | Synchronous tensor inference via `tritonclient.grpc` (port 8001) |
+| `infer_async.py` | Async parallel inference via `tritonclient.grpc.aio` with `asyncio.gather()` |
+| `metadata.py` | Server health, model metadata, and config introspection |
+
+## Triton API reference
+
+### OpenAI-compatible frontend (port 9000)
+
+The [OpenAI-compatible frontend](https://github.com/triton-inference-server/server/blob/main/docs/customization_guide/openai.md) provides standard OpenAI API endpoints. Uses the `openai` Python SDK.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/models` | GET | List available models |
+| `/v1/chat/completions` | POST | Chat completion (streaming and non-streaming) |
+
+### Generate extension (port 8000)
+
+The [generate extension](https://github.com/triton-inference-server/server/blob/main/docs/protocol/extension_generate.md) is Triton's native LLM text generation interface. Not part of the KServe v2 spec.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v2/models/{model}/generate` | POST | Single text generation (blocking) |
+| `/v2/models/{model}/generate_stream` | POST | Streaming text generation (SSE) |
+
+**Request format**:
+
+```json
+{
+  "text_input": "What is the capital of France?",
+  "parameters": { "max_tokens": 256 }
+}
 ```
 
-Uses `requests` directly -- no `tritonclient` dependency needed for the generate extension.
+### KServe v2 inference protocol (port 8000 HTTP / 8001 gRPC)
 
-### `examples/streaming.py` -- Streaming text generation
+The [KServe v2 inference protocol](https://kserve.github.io/website/latest/modelserving/data_plane/v2_protocol/) is the standard tensor-in/tensor-out interface for any model type.
 
-Sends a prompt to `POST /v2/models/{model}/generate_stream` and prints tokens as they arrive via Server-Sent Events. Analogous to a streaming chat completion.
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v2/health/live` | GET | Server liveness probe |
+| `/v2/health/ready` | GET | Server readiness probe |
+| `/v2/models/{model}` | GET | Model metadata (inputs, outputs, datatypes) |
+| `/v2/models/{model}/config` | GET | Model configuration |
+| `/v2/models/{model}/infer` | POST | Tensor inference |
 
-```bash
-python examples/streaming.py "Write a haiku about Triton"
-```
-
-Parses SSE `data:` lines and extracts `text_output` from each JSON payload. Tokens are printed with `flush=True` for real-time output.
-
-### `examples/infer.py` -- KServe v2 tensor inference
-
-Demonstrates the full `tritonclient.http` workflow for structured tensor inference:
-
-1. Create an `InferenceServerClient` connection
-2. Build an `InferInput` tensor from a numpy array
-3. Declare `InferRequestedOutput` tensors
-4. Call `client.infer()` to run the model
-5. Read results with `result.as_numpy()`
-
-```bash
-python examples/infer.py "classify this text"
-python examples/infer.py                        # defaults to "hello world"
-```
-
-**Adapting for your model**: The script has three constants at the top that you should change to match your model's metadata (use `examples/metadata.py` to discover them):
-
-```python
-INPUT_NAME = "text_input"       # name of the model's input tensor
-OUTPUT_NAME = "text_output"     # name of the model's output tensor
-DATATYPE = "BYTES"              # BYTES for strings, FP32 for floats, etc.
-```
-
-**Common datatype mappings**:
-
-| Triton Datatype | numpy dtype | Use case |
-|-----------------|-------------|----------|
-| `BYTES` | `object` | String inputs/outputs |
-| `FP32` | `np.float32` | Floating-point tensors |
-| `FP16` | `np.float16` | Half-precision tensors |
-| `INT32` | `np.int32` | Integer inputs (e.g. token IDs) |
-| `INT64` | `np.int64` | Long integer inputs |
-| `BOOL` | `np.bool_` | Boolean flags |
-
-**Example: adapting for a float-input model**:
-
-```python
-INPUT_NAME = "input"
-OUTPUT_NAME = "output"
-DATATYPE = "FP32"
-
-# Build input tensor -- shape [1, 3] with 3 float features
-input_data = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)
-```
-
-### `examples/metadata.py` -- Server health and model metadata
-
-Queries server health and model introspection endpoints via `tritonclient.http`. Useful for discovering model input/output names, shapes, and datatypes before writing inference code.
-
-```bash
-# Server health only (no TRITON_MODEL needed)
-python examples/metadata.py
-
-# Server health + specific model metadata
-python examples/metadata.py my-model
-TRITON_MODEL=my-model python examples/metadata.py
-```
-
-**Output includes**:
-
-- **Server health**: `is_server_live()`, `is_server_ready()`
-- **Model readiness**: `is_model_ready(model)`
-- **Model metadata**: Name, versions, platform, input tensors (name, shape, datatype), output tensors (name, shape, datatype)
-- **Model config**: Full JSON configuration from `get_model_config()`
-
-**Example output**:
-
-```
-=== Server Health ===
-  Live:  True
-  Ready: True
-
-=== Model: my-llm ===
-  Ready: True
-
-  Metadata:
-    Name:     my-llm
-    Versions: ['1']
-    Platform: python
-
-  Inputs:
-    - text_input            shape=[-1]  dtype=BYTES
-
-  Outputs:
-    - text_output           shape=[-1]  dtype=BYTES
-
-  Config:
-    { ... }
-```
+The `infer` endpoint uses structured tensor payloads with typed inputs/outputs, accessed via `tritonclient.http` or `tritonclient.grpc`.
 
 ## Flox environment details
 
@@ -292,26 +230,27 @@ TRITON_MODEL=my-model python examples/metadata.py
 |---------|---------|
 | `python312` | Python 3.12 interpreter |
 | `uv` | Fast Python package installer (creates venv, installs pip packages) |
-| `gcc-unwrapped` | Provides `libstdc++.so.6` needed by numpy's C extensions |
-| `zlib` | Provides `libz.so.1` needed by numpy's C extensions |
+| `gcc-unwrapped` | Provides `libstdc++.so.6` needed by numpy/grpcio C extensions |
+| `zlib` | Provides `libz.so.1` needed by numpy/grpcio C extensions |
 
 ### Pip packages (installed in venv on first activation)
 
 | Package | Purpose |
 |---------|---------|
-| `tritonclient[http]` | Official Triton HTTP client library (includes numpy) |
-| `rich` | Terminal markdown rendering for `triton-chat` |
-| `requests` | HTTP client for generate/generate_stream endpoints |
+| `tritonclient[all]` | Official Triton client (HTTP + gRPC, includes numpy) |
+| `openai` | OpenAI Python SDK for the OpenAI-compatible frontend |
+| `rich` | Terminal markdown rendering for `triton-chat` and `triton-test` |
+| `requests` | HTTP client for generate extension endpoints |
 
 ### Activation behavior
 
 On `flox activate`:
 
-1. Sets `TRITON_API_BASE`, `TRITON_MODEL`, and `TRITON_SYSTEM_PROMPT` with fallback defaults
-2. Adds `$FLOX_ENV/lib` to `LD_LIBRARY_PATH` (numpy needs `libstdc++.so.6` and `libz.so.1` from Nix packages)
+1. Sets `TRITON_OPENAI_BASE`, `TRITON_API_KEY`, `TRITON_API_BASE`, `TRITON_MODEL`, and `TRITON_SYSTEM_PROMPT` with fallback defaults
+2. Adds `$FLOX_ENV/lib` to `LD_LIBRARY_PATH` (numpy and grpcio need native libs from Nix packages)
 3. Creates a Python venv in `$FLOX_ENV_CACHE/venv` (if it doesn't exist)
 4. Installs pip packages on first activation (skips if `$VENV/.installed` marker exists)
-5. Adds the project root and venv `bin/` to `PATH` so `triton-chat` is available as a command
+5. Adds the project root and venv `bin/` to `PATH` so `triton-chat` and `triton-test` are available as commands
 
 To force a clean reinstall of pip packages:
 
@@ -324,31 +263,48 @@ flox activate
 
 ### `TRITON_MODEL is not set`
 
-All scripts except `metadata.py` require `TRITON_MODEL`. Set it before running:
+Most scripts require `TRITON_MODEL`. Set it before running:
 
 ```bash
 export TRITON_MODEL=my-model
 # or per-command
-TRITON_MODEL=my-model python examples/generate.py "hello"
+TRITON_MODEL=my-model triton-chat
 ```
 
-### Connection refused errors
+### Connection refused on port 9000 (OpenAI frontend)
 
-The Triton server is not running at `TRITON_API_BASE` (default `http://localhost:8000`). Verify:
+The OpenAI-compatible frontend runs on port 9000 by default. Verify it's enabled in your Triton server configuration and reachable:
+
+```bash
+curl http://localhost:9000/v1/models
+```
+
+If on a different host/port:
+
+```bash
+export TRITON_OPENAI_BASE=http://gpu-server:9000/v1
+```
+
+### Connection refused on port 8000 (generate/KServe)
+
+The Triton server is not running at `TRITON_API_BASE` (default `http://localhost:8000`):
 
 ```bash
 curl http://localhost:8000/v2/health/ready
 ```
 
-If your server is on a different host/port:
+### Connection refused on port 8001 (gRPC)
+
+gRPC inference uses port 8001 by default. Verify Triton's gRPC endpoint is enabled:
 
 ```bash
-export TRITON_API_BASE=http://gpu-server:8001
+# Set a custom gRPC port if needed
+export TRITON_GRPC_PORT=8001
 ```
 
 ### `404 Not Found` on generate endpoint
 
-The model may not support the generate extension. Only text-generation backends (vLLM, TensorRT-LLM, Python backend with generate support) expose `/v2/models/{model}/generate`. Use `examples/metadata.py` to check the model's inputs/outputs and switch to `examples/infer.py` for standard tensor inference.
+The model may not support the generate extension. Only text-generation backends (vLLM, TensorRT-LLM) expose `/v2/models/{model}/generate`. Use `examples/kserve/metadata.py` to check the model's interface.
 
 ### `ImportError: libstdc++.so.6` or `libz.so.1`
 
@@ -361,38 +317,40 @@ flox activate
 
 ### `tritonclient` host format
 
-`tritonclient.http.InferenceServerClient` expects `host:port` without a scheme prefix (not `http://host:port`). The example scripts strip the scheme automatically, but if you use the library directly, pass just `localhost:8000`.
+`tritonclient.http.InferenceServerClient` expects `host:port` without a scheme prefix (not `http://host:port`). The example scripts strip the scheme automatically.
 
-### Wrong input/output tensor names in `infer.py`
-
-Every model has different tensor names, shapes, and datatypes. Run `examples/metadata.py` first to discover them, then update the constants at the top of `infer.py`:
-
-```bash
-# Discover model interface
-TRITON_MODEL=my-model python examples/metadata.py
-
-# Then edit infer.py constants to match
-```
+For gRPC, `tritonclient.grpc.InferenceServerClient` also expects `host:port` without a scheme.
 
 ## File structure
 
 ```
 triton-api-client/
   .flox/
-    env/manifest.toml           # Flox environment (python312, uv, gcc-unwrapped, zlib, venv setup)
-  triton-chat                   # Interactive chat REPL (Python, executable)
+    env/manifest.toml           # Flox environment config
+  triton-chat                   # Interactive chat REPL (OpenAI SDK)
+  triton-test                   # Health/smoke/benchmark tool (OpenAI SDK)
   examples/
-    generate.py                 # Single text generation via generate endpoint
-    streaming.py                # Streaming text generation via generate_stream SSE
-    infer.py                    # KServe v2 tensor inference via tritonclient.http
-    metadata.py                 # Server health & model metadata introspection
+    openai/
+      chat.py                   # Single chat completion
+      streaming.py              # Streaming chat completion
+      batch.py                  # Batch completions from JSON
+    generate/
+      single.py                 # Single text generation
+      streaming.py              # Streaming text generation (SSE)
+    kserve/
+      infer_http.py             # HTTP tensor inference
+      infer_grpc.py             # gRPC tensor inference
+      infer_async.py            # Async gRPC parallel inference
+      metadata.py               # Server health & model metadata
   README.md
 ```
 
 ## Related documentation
 
 - [Triton Inference Server](https://github.com/triton-inference-server/server) -- The server this client targets
-- [KServe v2 Inference Protocol](https://kserve.github.io/website/latest/modelserving/data_plane/v2_protocol/) -- Standard tensor inference protocol
+- [Triton OpenAI-Compatible Frontend](https://github.com/triton-inference-server/server/blob/main/docs/customization_guide/openai.md) -- OpenAI API compatibility layer
 - [Triton Generate Extension](https://github.com/triton-inference-server/server/blob/main/docs/protocol/extension_generate.md) -- Text generation endpoint spec
+- [KServe v2 Inference Protocol](https://kserve.github.io/website/latest/modelserving/data_plane/v2_protocol/) -- Standard tensor inference protocol
 - [tritonclient Python API](https://github.com/triton-inference-server/client) -- Official client library documentation
+- [OpenAI Python SDK](https://github.com/openai/openai-python) -- OpenAI client used for the frontend
 - [Flox](https://flox.dev) -- Environment manager powering this project

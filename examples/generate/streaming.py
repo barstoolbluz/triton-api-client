@@ -2,7 +2,7 @@
 """Streaming text generation via a Triton Inference Server generate_stream endpoint.
 
 Usage:
-  python examples/streaming.py "Explain quantum computing"
+  python examples/generate/streaming.py "Explain quantum computing"
 """
 
 import json

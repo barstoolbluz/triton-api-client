@@ -2,7 +2,7 @@
 """Single text generation via a Triton Inference Server generate endpoint.
 
 Usage:
-  python examples/generate.py "What is the capital of France?"
+  python examples/generate/single.py "What is the capital of France?"
 """
 
 import os

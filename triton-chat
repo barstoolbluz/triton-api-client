@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Interactive chat REPL for Triton Inference Server using the generate endpoint."""
+"""Interactive chat REPL for Triton Inference Server via the OpenAI-compatible frontend."""
 
-import json
 import os
 import sys
 
-import requests
+from openai import OpenAI
 
-TRITON_API_BASE = os.environ.get("TRITON_API_BASE", "http://localhost:8000")
+TRITON_OPENAI_BASE = os.environ.get("TRITON_OPENAI_BASE", "http://localhost:9000/v1")
+TRITON_API_KEY = os.environ.get("TRITON_API_KEY", "EMPTY")
 TRITON_MODEL = os.environ.get("TRITON_MODEL", "")
 TRITON_SYSTEM_PROMPT = os.environ.get(
     "TRITON_SYSTEM_PROMPT", "You are a helpful assistant."
@@ -22,38 +22,12 @@ Commands:
   /quit             Exit the chat"""
 
 
-def build_prompt(system_prompt, history):
-    """Build a multi-turn prompt from conversation history."""
-    parts = [system_prompt, ""]
-    for turn in history:
-        if turn["role"] == "user":
-            parts.append(f"User: {turn['content']}")
-        elif turn["role"] == "assistant":
-            parts.append(f"Assistant: {turn['content']}")
-    parts.append("Assistant:")
-    return "\n".join(parts)
-
-
-def stream_generate(base_url, model, prompt, parameters=None):
-    """Stream tokens from the generate_stream endpoint via SSE."""
-    url = f"{base_url}/v2/models/{model}/generate_stream"
-    payload = {"text_input": prompt, "parameters": parameters or {}}
-    with requests.post(url, json=payload, stream=True, timeout=120) as resp:
-        resp.raise_for_status()
-        for line in resp.iter_lines(decode_unicode=True):
-            if not line or not line.startswith("data:"):
-                continue
-            data = json.loads(line[len("data:"):].strip())
-            text = data.get("text_output", "")
-            if text:
-                yield text
-
-
 def main():
     from rich.console import Console
     from rich.markdown import Markdown
 
     console = Console()
+    client = OpenAI(base_url=TRITON_OPENAI_BASE, api_key=TRITON_API_KEY)
 
     model = TRITON_MODEL
     if not model:
@@ -62,9 +36,9 @@ def main():
         sys.exit(1)
 
     system_prompt = TRITON_SYSTEM_PROMPT
-    history = []
+    messages = []
 
-    console.print(f"[bold]triton-chat[/bold] connected to [cyan]{TRITON_API_BASE}[/cyan]")
+    console.print(f"[bold]triton-chat[/bold] connected to [cyan]{TRITON_OPENAI_BASE}[/cyan]")
     console.print(f"Model: [green]{model}[/green]")
     console.print("Type [bold]/help[/bold] for commands, [bold]/quit[/bold] to exit.\n")
 
@@ -90,7 +64,7 @@ def main():
             elif cmd == "help":
                 console.print(HELP_TEXT)
             elif cmd == "clear":
-                history.clear()
+                messages.clear()
                 console.print("[dim]Conversation cleared.[/dim]")
             elif cmd == "model":
                 if arg:
@@ -108,26 +82,35 @@ def main():
                 console.print(f"[red]Unknown command: /{cmd}[/red]")
             continue
 
-        history.append({"role": "user", "content": user_input})
-        prompt = build_prompt(system_prompt, history)
+        messages.append({"role": "user", "content": user_input})
+
+        request_messages = [{"role": "system", "content": system_prompt}] + messages
 
         try:
+            stream = client.chat.completions.create(
+                model=model,
+                messages=request_messages,
+                stream=True,
+            )
+
             chunks = []
-            for token in stream_generate(TRITON_API_BASE, model, prompt, {"max_tokens": 512}):
-                chunks.append(token)
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    chunks.append(delta.content)
 
             response_text = "".join(chunks)
-            history.append({"role": "assistant", "content": response_text})
+            messages.append({"role": "assistant", "content": response_text})
             console.print()
             console.print(Markdown(response_text))
             console.print()
 
         except KeyboardInterrupt:
             console.print("\n[dim]Generation interrupted.[/dim]")
-            history.pop()
+            messages.pop()
         except Exception as e:
             console.print(f"\n[red]Error: {e}[/red]")
-            history.pop()
+            messages.pop()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""Health check, smoke test, and benchmark for Triton's OpenAI-compatible frontend.
+
+Usage:
+  triton-test                                    # health + smoke (pass/fail, exit 0/1)
+  triton-test bench                              # benchmark (10 requests, concurrency 1)
+  triton-test bench -n 50 --concurrent 5         # heavier load test
+  triton-test bench --prompt "..." --max-tokens 256
+"""
+
+import argparse
+import os
+import statistics
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from openai import OpenAI
+from rich.console import Console
+from rich.table import Table
+
+TRITON_OPENAI_BASE = os.environ.get("TRITON_OPENAI_BASE", "http://localhost:9000/v1")
+TRITON_API_KEY = os.environ.get("TRITON_API_KEY", "EMPTY")
+TRITON_MODEL = os.environ.get("TRITON_MODEL", "")
+
+DEFAULT_PROMPT = "Write a single short paragraph about the importance of testing software."
+DEFAULT_MAX_TOKENS = 128
+
+console = Console()
+
+
+def make_client():
+    return OpenAI(base_url=TRITON_OPENAI_BASE, api_key=TRITON_API_KEY)
+
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
+
+def health_check(client):
+    """Check server connectivity and list available models."""
+    console.print("\n[bold]--- Health Check ---[/bold]")
+    try:
+        models = client.models.list()
+        model_ids = [m.id for m in models.data]
+    except Exception as e:
+        console.print(f"[red]FAIL[/red] Could not reach server at {TRITON_OPENAI_BASE}")
+        console.print(f"     {e}")
+        return False
+
+    console.print(f"[green]OK[/green]   Server reachable at {TRITON_OPENAI_BASE}")
+    console.print(f"     Models available: {len(model_ids)}")
+    for mid in model_ids:
+        marker = " [green]<-- TRITON_MODEL[/green]" if mid == TRITON_MODEL else ""
+        console.print(f"       - {mid}{marker}")
+
+    if TRITON_MODEL and TRITON_MODEL not in model_ids:
+        console.print(f"[yellow]WARN[/yellow] TRITON_MODEL '{TRITON_MODEL}' not found in model list")
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Smoke test
+# ---------------------------------------------------------------------------
+
+def smoke_test(client):
+    """Run non-streaming and streaming completions to verify basic functionality."""
+    console.print("\n[bold]--- Smoke Test ---[/bold]")
+
+    if not TRITON_MODEL:
+        console.print("[red]FAIL[/red] TRITON_MODEL is not set; cannot run smoke test")
+        return False
+
+    ok = True
+
+    # Non-streaming
+    try:
+        t0 = time.perf_counter()
+        response = client.chat.completions.create(
+            model=TRITON_MODEL,
+            messages=[{"role": "user", "content": "Say hello in one sentence."}],
+            max_tokens=64,
+        )
+        latency = time.perf_counter() - t0
+        text = response.choices[0].message.content or ""
+        tokens = response.usage.completion_tokens if response.usage else 0
+
+        if text.strip():
+            console.print(f"[green]OK[/green]   Non-streaming: {latency:.2f}s, {tokens} tokens")
+        else:
+            console.print("[red]FAIL[/red] Non-streaming: empty response")
+            ok = False
+    except Exception as e:
+        console.print(f"[red]FAIL[/red] Non-streaming: {e}")
+        ok = False
+
+    # Streaming
+    try:
+        t0 = time.perf_counter()
+        ttft = None
+        chunk_count = 0
+        completion_tokens = None
+        stream = client.chat.completions.create(
+            model=TRITON_MODEL,
+            messages=[{"role": "user", "content": "Say goodbye in one sentence."}],
+            max_tokens=64,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        for chunk in stream:
+            if chunk.usage is not None:
+                completion_tokens = chunk.usage.completion_tokens
+            if chunk.choices and chunk.choices[0].delta.content:
+                if ttft is None:
+                    ttft = time.perf_counter() - t0
+                chunk_count += 1
+        total = time.perf_counter() - t0
+        tokens = completion_tokens if completion_tokens is not None else chunk_count
+
+        if chunk_count > 0:
+            console.print(
+                f"[green]OK[/green]   Streaming: TTFT {ttft:.3f}s, "
+                f"total {total:.2f}s, {tokens} tokens"
+            )
+        else:
+            console.print("[red]FAIL[/red] Streaming: no chunks received")
+            ok = False
+    except Exception as e:
+        console.print(f"[red]FAIL[/red] Streaming: {e}")
+        ok = False
+
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Benchmark
+# ---------------------------------------------------------------------------
+
+def run_single_request(client, prompt, max_tokens):
+    """Run a single streaming request and return timing metrics."""
+    t0 = time.perf_counter()
+    ttft = None
+    chunk_times = []
+    completion_tokens = None
+
+    stream = client.chat.completions.create(
+        model=TRITON_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+    for chunk in stream:
+        # Final chunk carries usage stats (choices may be empty)
+        if chunk.usage is not None:
+            completion_tokens = chunk.usage.completion_tokens
+        if chunk.choices and chunk.choices[0].delta.content:
+            now = time.perf_counter()
+            if ttft is None:
+                ttft = now - t0
+            chunk_times.append(now)
+
+    total = time.perf_counter() - t0
+
+    # Use SDK-reported token count when available, fall back to chunk count
+    tokens = completion_tokens if completion_tokens is not None else len(chunk_times)
+
+    if tokens == 0 and not chunk_times:
+        return {
+            "ttft": 0,
+            "latency": total,
+            "tokens": 0,
+            "tps": 0,
+            "itl": 0,
+            "error": "empty response (no content chunks)",
+        }
+
+    tps = tokens / total if total > 0 else 0
+
+    # Inter-token latency: average time between consecutive content chunks
+    itl = 0.0
+    if len(chunk_times) > 1:
+        gaps = [chunk_times[i] - chunk_times[i - 1] for i in range(1, len(chunk_times))]
+        itl = statistics.mean(gaps)
+
+    return {
+        "ttft": ttft if ttft is not None else total,
+        "latency": total,
+        "tokens": tokens,
+        "tps": tps,
+        "itl": itl,
+        "error": None,
+    }
+
+
+def benchmark(n, concurrent, prompt, max_tokens):
+    """Run n requests with the given concurrency and report statistics."""
+    console.print("\n[bold]--- Benchmark ---[/bold]")
+
+    if not TRITON_MODEL:
+        console.print("[red]FAIL[/red] TRITON_MODEL is not set; cannot run benchmark")
+        return False
+
+    console.print(f"     Requests: {n}, Concurrency: {concurrent}, Max tokens: {max_tokens}")
+    console.print(f"     Model: {TRITON_MODEL}")
+    console.print()
+
+    results = []
+    errors = 0
+    t_start = time.perf_counter()
+
+    with ThreadPoolExecutor(max_workers=concurrent) as pool:
+        futures = []
+        for _ in range(n):
+            client = make_client()
+            futures.append(pool.submit(run_single_request, client, prompt, max_tokens))
+
+        for i, future in enumerate(as_completed(futures), 1):
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                errors += 1
+                results.append({"error": str(e)})
+            pct = i * 100 // n
+            print(f"\r     Progress: {i}/{n} ({pct}%)", end="", flush=True)
+
+    wall_time = time.perf_counter() - t_start
+    console.print()
+
+    # Filter successful results
+    ok_results = [r for r in results if r.get("error") is None]
+
+    if not ok_results:
+        console.print("[red]All requests failed.[/red]")
+        return False
+
+    ttfts = [r["ttft"] for r in ok_results]
+    latencies = [r["latency"] for r in ok_results]
+    tps_list = [r["tps"] for r in ok_results]
+    itls = [r["itl"] for r in ok_results if r["itl"] > 0]
+    total_tokens = sum(r["tokens"] for r in ok_results)
+
+    def percentiles(data):
+        s = sorted(data)
+        n_ = len(s)
+        p50 = s[int(min(n_ * 0.50, n_ - 1))]
+        p90 = s[int(min(n_ * 0.90, n_ - 1))]
+        p99 = s[int(min(n_ * 0.99, n_ - 1))]
+        return p50, p90, p99
+
+    ttft_p50, ttft_p90, ttft_p99 = percentiles(ttfts)
+    lat_p50, lat_p90, lat_p99 = percentiles(latencies)
+
+    table = Table(title="Results", show_header=True, header_style="bold")
+    table.add_column("Metric", style="cyan")
+    table.add_column("p50", justify="right")
+    table.add_column("p90", justify="right")
+    table.add_column("p99", justify="right")
+
+    table.add_row(
+        "TTFT (s)",
+        f"{ttft_p50:.3f}",
+        f"{ttft_p90:.3f}",
+        f"{ttft_p99:.3f}",
+    )
+    table.add_row(
+        "Latency (s)",
+        f"{lat_p50:.3f}",
+        f"{lat_p90:.3f}",
+        f"{lat_p99:.3f}",
+    )
+    if itls:
+        itl_p50, itl_p90, itl_p99 = percentiles(itls)
+        table.add_row(
+            "ITL (s)",
+            f"{itl_p50:.4f}",
+            f"{itl_p90:.4f}",
+            f"{itl_p99:.4f}",
+        )
+    console.print(table)
+
+    console.print(f"\n     Avg tokens/sec:    {statistics.mean(tps_list):.1f}")
+    console.print(f"     Total tokens:      {total_tokens}")
+    console.print(f"     Throughput:         {total_tokens / wall_time:.1f} tok/s (aggregate)")
+    console.print(f"     Wall time:         {wall_time:.2f}s")
+    console.print(f"     Successful:        {len(ok_results)}/{n}")
+    if errors:
+        console.print(f"     [red]Errors:           {errors}[/red]")
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Test Triton's OpenAI-compatible frontend."
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    bench_parser = sub.add_parser("bench", help="Run a benchmark")
+    bench_parser.add_argument("-n", type=int, default=10, help="Number of requests (default: 10)")
+    bench_parser.add_argument("--concurrent", type=int, default=1, help="Concurrency level (default: 1)")
+    bench_parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT, help="Prompt text")
+    bench_parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, help="Max tokens per response (default: 128)")
+
+    args = parser.parse_args()
+
+    client = make_client()
+
+    # Always run health check first
+    healthy = health_check(client)
+    if not healthy:
+        sys.exit(1)
+
+    if args.command == "bench":
+        ok = benchmark(args.n, args.concurrent, args.prompt, args.max_tokens)
+        if not ok:
+            sys.exit(1)
+    else:
+        # Default: health + smoke
+        ok = smoke_test(client)
+        if not ok:
+            sys.exit(1)
+
+    console.print("\n[green]All checks passed.[/green]")
+
+
+if __name__ == "__main__":
+    main()
