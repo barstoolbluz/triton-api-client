@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Interactive chat REPL for Triton Inference Server using the generate endpoint."""
+
+import json
+import os
+import sys
+
+import requests
+
+TRITON_API_BASE = os.environ.get("TRITON_API_BASE", "http://localhost:8000")
+TRITON_MODEL = os.environ.get("TRITON_MODEL", "")
+TRITON_SYSTEM_PROMPT = os.environ.get(
+    "TRITON_SYSTEM_PROMPT", "You are a helpful assistant."
+)
+
+HELP_TEXT = """\
+Commands:
+  /clear            Clear conversation history
+  /model [name]     Show or change the model
+  /system [prompt]  Show or change the system prompt
+  /help             Show this help
+  /quit             Exit the chat"""
+
+
+def build_prompt(system_prompt, history):
+    """Build a multi-turn prompt from conversation history."""
+    parts = [system_prompt, ""]
+    for turn in history:
+        if turn["role"] == "user":
+            parts.append(f"User: {turn['content']}")
+        elif turn["role"] == "assistant":
+            parts.append(f"Assistant: {turn['content']}")
+    parts.append("Assistant:")
+    return "\n".join(parts)
+
+
+def stream_generate(base_url, model, prompt, parameters=None):
+    """Stream tokens from the generate_stream endpoint via SSE."""
+    url = f"{base_url}/v2/models/{model}/generate_stream"
+    payload = {"text_input": prompt, "parameters": parameters or {}}
+    with requests.post(url, json=payload, stream=True, timeout=120) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data:"):
+                continue
+            data = json.loads(line[len("data:"):].strip())
+            text = data.get("text_output", "")
+            if text:
+                yield text
+
+
+def main():
+    from rich.console import Console
+    from rich.markdown import Markdown
+
+    console = Console()
+
+    model = TRITON_MODEL
+    if not model:
+        console.print("[red]TRITON_MODEL is not set.[/red]")
+        console.print("Set it via: export TRITON_MODEL=<model_name>")
+        sys.exit(1)
+
+    system_prompt = TRITON_SYSTEM_PROMPT
+    history = []
+
+    console.print(f"[bold]triton-chat[/bold] connected to [cyan]{TRITON_API_BASE}[/cyan]")
+    console.print(f"Model: [green]{model}[/green]")
+    console.print("Type [bold]/help[/bold] for commands, [bold]/quit[/bold] to exit.\n")
+
+    while True:
+        try:
+            user_input = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\nBye!")
+            break
+
+        if not user_input:
+            continue
+
+        # Slash commands
+        if user_input.startswith("/"):
+            cmd, _, arg = user_input[1:].partition(" ")
+            cmd = cmd.lower()
+            arg = arg.strip()
+
+            if cmd in ("quit", "exit"):
+                console.print("Bye!")
+                break
+            elif cmd == "help":
+                console.print(HELP_TEXT)
+            elif cmd == "clear":
+                history.clear()
+                console.print("[dim]Conversation cleared.[/dim]")
+            elif cmd == "model":
+                if arg:
+                    model = arg
+                    console.print(f"Model set to [green]{model}[/green]")
+                else:
+                    console.print(f"Model: [green]{model}[/green]")
+            elif cmd == "system":
+                if arg:
+                    system_prompt = arg
+                    console.print(f"System prompt set to: [yellow]{system_prompt}[/yellow]")
+                else:
+                    console.print(f"System prompt: [yellow]{system_prompt}[/yellow]")
+            else:
+                console.print(f"[red]Unknown command: /{cmd}[/red]")
+            continue
+
+        history.append({"role": "user", "content": user_input})
+        prompt = build_prompt(system_prompt, history)
+
+        try:
+            chunks = []
+            for token in stream_generate(TRITON_API_BASE, model, prompt, {"max_tokens": 512}):
+                chunks.append(token)
+
+            response_text = "".join(chunks)
+            history.append({"role": "assistant", "content": response_text})
+            console.print()
+            console.print(Markdown(response_text))
+            console.print()
+
+        except KeyboardInterrupt:
+            console.print("\n[dim]Generation interrupted.[/dim]")
+            history.pop()
+        except Exception as e:
+            console.print(f"\n[red]Error: {e}[/red]")
+            history.pop()
+
+
+if __name__ == "__main__":
+    main()
