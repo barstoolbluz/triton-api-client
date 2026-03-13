@@ -13,6 +13,8 @@ on-activate = '''
   export TRITON_API_BASE="${TRITON_API_BASE:-http://localhost:8000}"
   export TRITON_MODEL="${TRITON_MODEL:-}"
   export TRITON_SYSTEM_PROMPT="${TRITON_SYSTEM_PROMPT:-You are a helpful assistant.}"
+  export TRITON_TOKENIZER="${TRITON_TOKENIZER:-}"
+  export TRITON_GRPC_PORT="${TRITON_GRPC_PORT:-8001}"
 
   # numpy and grpcio need libstdc++ and libz
   export LD_LIBRARY_PATH="$FLOX_ENV/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -26,9 +28,9 @@ on-activate = '''
   export VIRTUAL_ENV_DISABLE_PROMPT=1
   source "$VENV/bin/activate"
 
-  if [ ! -f "$VENV/.installed" ]; then
-    uv pip install "tritonclient[all]" openai rich requests
-    touch "$VENV/.installed"
+  if [ ! -f "$VENV/.installed-v2" ]; then
+    uv pip install "tritonclient[all]" openai rich requests transformers
+    touch "$VENV/.installed-v2"
   fi
 '''
 

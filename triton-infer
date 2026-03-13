@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Universal inference CLI for Triton Inference Server.
+
+Auto-detects the model type via metadata introspection and routes to the
+appropriate inference path:
+  - text_input models (vLLM, etc.)  → generate extension
+  - input_ids models (TRT-LLM)      → KServe v2 tensor inference with tokenization
+
+Usage:
+  TRITON_MODEL=my-model triton-infer "The capital of France is"
+  TRITON_MODEL=my-model triton-infer -v "Hello!"
+  TRITON_MODEL=my-model triton-infer --max-tokens 128 "Explain quantum computing"
+  TRITON_MODEL=my-model triton-infer --tokenizer Qwen/Qwen2.5-0.5B "Hello"
+"""
+
+import argparse
+import os
+import sys
+
+import numpy as np
+import requests
+import tritonclient.http as httpclient
+
+TRITON_API_BASE = os.environ.get("TRITON_API_BASE", "http://localhost:8000")
+TRITON_MODEL = os.environ.get("TRITON_MODEL", "")
+TRITON_TOKENIZER = os.environ.get("TRITON_TOKENIZER", "")
+
+
+def detect_model_type(client, model_name):
+    """Detect model type by inspecting input tensor names."""
+    meta = client.get_model_metadata(model_name)
+    input_names = {inp["name"] for inp in meta.get("inputs", [])}
+    if "text_input" in input_names:
+        return "generate"
+    elif "input_ids" in input_names:
+        return "trtllm"
+    return "unknown"
+
+
+def resolve_tokenizer(client, model, cli_tokenizer):
+    """Resolve tokenizer: CLI arg > env var > model config > error."""
+    if cli_tokenizer:
+        return cli_tokenizer
+    if TRITON_TOKENIZER:
+        return TRITON_TOKENIZER
+    try:
+        config = client.get_model_config(model)
+        params = config.get("parameters", {})
+        tokenizer_dir = params.get("tokenizer_dir", {})
+        value = tokenizer_dir.get("string_value", "") if isinstance(tokenizer_dir, dict) else ""
+        if value:
+            return value
+    except Exception:
+        pass
+    print("Error: No tokenizer specified.", file=sys.stderr)
+    print("  Set TRITON_TOKENIZER, pass --tokenizer, or configure tokenizer_dir in model config.", file=sys.stderr)
+    sys.exit(1)
+
+
+def infer_generate(prompt, max_tokens):
+    """Inference via the generate extension (text_input/text_output models)."""
+    url = f"{TRITON_API_BASE}/v2/models/{TRITON_MODEL}/generate"
+    payload = {
+        "text_input": prompt,
+        "parameters": {"max_tokens": max_tokens},
+    }
+    response = requests.post(url, json=payload, timeout=120)
+    response.raise_for_status()
+    print(response.json()["text_output"])
+
+
+def infer_trtllm(client, prompt, max_tokens, tokenizer_override,
+                  temperature=None, top_k=None, top_p=None):
+    """Inference via KServe v2 tensors with client-side tokenization (TRT-LLM models)."""
+    tokenizer_id = resolve_tokenizer(client, TRITON_MODEL, tokenizer_override)
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
+
+    # Tokenize
+    token_ids = tokenizer.encode(prompt)
+    seq_len = len(token_ids)
+    end_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else end_id
+
+    # Build input tensors
+    input_ids = httpclient.InferInput("input_ids", [1, seq_len], "INT32")
+    input_ids.set_data_from_numpy(np.array([token_ids], dtype=np.int32))
+
+    input_lengths = httpclient.InferInput("input_lengths", [1, 1], "INT32")
+    input_lengths.set_data_from_numpy(np.array([[seq_len]], dtype=np.int32))
+
+    request_output_len = httpclient.InferInput("request_output_len", [1, 1], "INT32")
+    request_output_len.set_data_from_numpy(np.array([[max_tokens]], dtype=np.int32))
+
+    end_id_tensor = httpclient.InferInput("end_id", [1, 1], "INT32")
+    end_id_tensor.set_data_from_numpy(np.array([[end_id]], dtype=np.int32))
+
+    pad_id_tensor = httpclient.InferInput("pad_id", [1, 1], "INT32")
+    pad_id_tensor.set_data_from_numpy(np.array([[pad_id]], dtype=np.int32))
+
+    # Optional sampling parameters
+    optional_inputs = []
+    if temperature is not None:
+        t = httpclient.InferInput("temperature", [1, 1], "FP32")
+        t.set_data_from_numpy(np.array([[temperature]], dtype=np.float32))
+        optional_inputs.append(t)
+    if top_k is not None:
+        tk = httpclient.InferInput("runtime_top_k", [1, 1], "INT32")
+        tk.set_data_from_numpy(np.array([[top_k]], dtype=np.int32))
+        optional_inputs.append(tk)
+    if top_p is not None:
+        tp = httpclient.InferInput("runtime_top_p", [1, 1], "FP32")
+        tp.set_data_from_numpy(np.array([[top_p]], dtype=np.float32))
+        optional_inputs.append(tp)
+
+    # Request outputs
+    output_ids_req = httpclient.InferRequestedOutput("output_ids")
+    sequence_length_req = httpclient.InferRequestedOutput("sequence_length")
+
+    # Run inference
+    result = client.infer(
+        model_name=TRITON_MODEL,
+        inputs=[input_ids, input_lengths, request_output_len, end_id_tensor, pad_id_tensor] + optional_inputs,
+        outputs=[output_ids_req, sequence_length_req],
+    )
+
+    # Parse output
+    out_ids = result.as_numpy("output_ids")
+    seq_lengths = result.as_numpy("sequence_length")
+    output_len = int(seq_lengths[0][0])
+    generated_ids = out_ids[0][0][:output_len].tolist()
+
+    # Detokenize
+    text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    print(text)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Universal Triton inference CLI with auto-detection",
+    )
+    parser.add_argument("prompt", help="Input prompt")
+    parser.add_argument("-m", "--model", default="", help="Model name (overrides TRITON_MODEL)")
+    parser.add_argument("-n", "--max-tokens", type=int, default=256, help="Max output tokens (default: 256)")
+    parser.add_argument("-t", "--tokenizer", default="", help="HuggingFace tokenizer (TRT-LLM only)")
+    parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature (TRT-LLM only)")
+    parser.add_argument("--top-k", type=int, default=None, help="Top-k sampling (TRT-LLM only)")
+    parser.add_argument("--top-p", type=float, default=None, help="Top-p (nucleus) sampling (TRT-LLM only)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print detection info to stderr")
+    args = parser.parse_args()
+
+    global TRITON_MODEL
+    if args.model:
+        TRITON_MODEL = args.model
+
+    if not TRITON_MODEL:
+        print("Error: TRITON_MODEL is not set. Use -m or export TRITON_MODEL.", file=sys.stderr)
+        sys.exit(1)
+
+    # Connect and detect model type
+    server_url = TRITON_API_BASE.replace("http://", "").replace("https://", "")
+    client = httpclient.InferenceServerClient(url=server_url)
+
+    try:
+        model_type = detect_model_type(client, TRITON_MODEL)
+    except Exception as e:
+        print(f"Error: Could not fetch metadata for model '{TRITON_MODEL}': {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.verbose:
+        print(f"Model:    {TRITON_MODEL}", file=sys.stderr)
+        print(f"Type:     {model_type}", file=sys.stderr)
+        print(f"Server:   {TRITON_API_BASE}", file=sys.stderr)
+
+    if model_type == "generate":
+        infer_generate(args.prompt, args.max_tokens)
+    elif model_type == "trtllm":
+        infer_trtllm(client, args.prompt, args.max_tokens, args.tokenizer,
+                     temperature=args.temperature, top_k=args.top_k, top_p=args.top_p)
+    else:
+        print(f"Error: Unknown model type for '{TRITON_MODEL}'.", file=sys.stderr)
+        print("  Model inputs don't match any known pattern (text_input or input_ids).", file=sys.stderr)
+        print("  Use the example scripts directly: examples/kserve/ or examples/trtllm/", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
